@@ -1,0 +1,190 @@
+# Kloudlite Project Explanation
+
+## 1. Project Overview: What is Kloudlite?
+
+**Kloudlite** is a specialized **Cloud Development Environment (CDE)** platform. Its primary goal is to solve the "Inner Development Loop" problem for cloud-native applications.
+
+In simple terms: It allows you to develop locally on your machine while your code is connected to your live cloud services (databases, other microservices) running in a **Kubernetes Cluster** (a system that groups many computers, or "nodes," together to run containerized applications as if they were a single super-computer). It mimics the experience of developing a **Monolith** (a traditional app where all features like auth, payments, and UI are bundled in one giant code file) while working on a distributed **Microservices Architecture** (a modern style where each feature is a separate mini-app running on its own server).
+
+### How does it differ from others?
+Unlike standard **Cloud IDEs** (like GitHub Codespaces) that move your **entire** dev environment (your code editor, terminal, and compiler) to the cloud, Kloudlite focuses on **hybrid** development. It connects your local machine (or a cloud workspace) to the cluster via high-performance **Tunnels** (secure, private pipes over the internet that connect two separated networks), making remote services feel like they are running on `localhost` (your computer's internal network address).
+
+### Key Features
+-   **Service Interception**: You can "intercept" traffic meant for a service in the cluster and route it to your local code. This lets you debug a single service in the context of the full application.
+-   **Environment Management**: Every developer can have their own isolated environment (**Namespace** - a virtual partition within a cluster to keep your resources separate from others), so you don't step on teammates' toes.
+-   **Infrastructure as Code**: It creates real Kubernetes resources, not just **Mocked Services** (fake versions of services that return dummy data for testing).
+
+---
+
+## 2. Is it any good? Do we need it?
+
+### The Verdict: **YES**
+This project addresses a critical pain point in modern software engineering.
+
+### The "Why" (Real Developer Needs)
+1.  **The "Works on my Machine" Problem**: In Kubernetes-land, running 20+ microservices on a generic laptop is impossible. Developers often resort to **Mocking Dependencies** (pretending external services exist by hardcoding fake responses), which leads to "it worked locally but crashed in staging." Kloudlite solves this by letting you run *only* the service you're editing locally, while everything else runs in the cloud.
+2.  **Staging Bottlenecks**: In many teams, the shared "Staging" environment is constantly broken because 10 people are deploying to it simultaneously. Kloudlite gives everyone their own slice of the cluster.
+3.  **Speed**: It eliminates the `Code -> Commit -> CI/CD Build -> Deploy -> Wait -> Test` cycle (**CI/CD** stands for Continuous Integration/Continuous Deployment, the automated pipeline that runs tests and uploads your code to servers). You just `Code -> Save`, and since your local machine is intercepted into the cluster, the changes are live instantly.
+
+---
+
+## 3. Theoretical Foundations: Architecture & Networking
+
+As a computer engineering student, you'll want to understand the underlying mechanisms.
+
+### A. The Networking Layer (WireGuard)
+The project uses **WireGuard**, a modern, high-performance **VPN Protocol** (Virtual Private Network - technology that encrypts your internet traffic and creates a secure tunnel between your device and a server).
+-   **`kltun` (Kloudlite Tunnel)**: This CLI tool runs on your local machine. It creates a **Network Interface** (a virtual network card, usually named `wg0`) that connects securely to the Kubernetes cluster.
+-   **UDP-to-TCP Proxying**: Since WireGuard uses **UDP** (User Datagram Protocol - a fast communication protocol that sends data without checking if it arrived) and many firewalls block it, Kloudlite implements a `proxyguard` client. It encapsulates WireGuard packets inside **TCP** (Transmission Control Protocol - the reliable protocol that powers the web, ensuring every packet arrives correctly) using HTTPS to "punch" through firewalls.
+-   **DNS Resolution**: When you connect, `kltun` also configures your local **DNS** (Domain Name System - the phonebook of the internet that turns names like `redis.internal` into IP addresses) to resolve cluster hostnames to their **ClusterIPs** (internal IP addresses valid only inside the cluster), which are then routed through the tunnel.
+
+### B. Service Interception (The "Magic")
+How does traffic destined for a **Pod** (the smallest unit in Kubernetes, basically a running container/process) in the cloud end up on your laptop?
+
+#### Visualizing the Packet Flow
+```mermaid
+sequenceDiagram
+    participant Client as Cluster Service (Frontend)
+    participant K8s as K8s Service (Auth)
+    participant Proxy as Intercept Proxy (Socat)
+    participant Tunnel as WireGuard Tunnel
+    participant Laptop as Your Laptop (Localhost:8080)
+
+    Note over Client, Laptop: Normal Flow: Frontend calls Auth
+    Client->>K8s: GET /login (Target: Auth Svc)
+    
+    Note over K8s, Proxy: Intercept Enabled!
+    K8s->>Proxy: Traffic routed to Socat Pod
+    
+    Note over Proxy, Laptop: Tunneling
+    Proxy->>Tunnel: Forward TCP Packet
+    Tunnel->>Laptop: Decapsulate & Send to Local Port
+    
+    Laptop->>Laptop: Your Local Code handles Request
+    
+    Laptop->>Tunnel: Response (200 OK)
+    Tunnel->>Proxy: Encapsulate & Send back
+    Proxy->>Client: Response
+```
+
+1.  **The Trigger**: You click "Intercept".
+2.  **The Controller Action**: The `composition` controller modifies the Kubernetes **Deployment** (a "blueprint" that tells Kubernetes how many copies of your app to run and which version to use).
+3.  **The Switch**: It replaces the real container with a **Proxy Container** (a lightweight container running `alpine/socat`).
+    -   Command: `socat TCP-LISTEN:80,fork TCP:workspace-headless-svc:80`. (`socat` is a command-line utility that establishes two byte streams and transfers data between them - here, piping traffic from the cluster to your tunnel).
+4.  **The Route**: Traffic hitting the service is caught by `socat`, forwarded to your Workspace's **Headless Service** (a specific type of Kubernetes Service that doesn't load balance, but points directly to a specific Pod), then through the WireGuard tunnel to your laptop.
+
+---
+
+## 4. Code Walkthrough: The `kl intercept` Command
+
+Let's trace exactly what happens in the code when you run `kl intercept start auth-service`.
+
+### Step 1: The CLI Command ([api/cmd/kl/cmd/intercept.go](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go))
+1.  **[handleInterceptStart](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go#295-326)**: This function is called with the service name.
+2.  **Find Service**: It calls [findServiceByName](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go#200-225) to locate the service in the Kubernetes **CRD** (Custom Resource Definition - a way to extend Kubernetes API with your own data types. Here, [Composition](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go#188-199) is a custom resource Kloudlite invented).
+3.  **Validation**: Checks if it's already intercepted.
+4.  **Update Spec**: It constructs a `ServiceInterceptConfig` struct (a Go data structure) and appends it to `composition.Spec.Intercepts`.
+    ```go
+    // This code creates a "request" meant for the K8s cluster
+    interceptConfig := environmentv1.ServiceInterceptConfig{
+        ServiceName:  svc.ServiceName,
+        PortMappings: portMappings,
+        Enabled:      true,
+        WorkspaceRef: &corev1.ObjectReference{...},
+    }
+    ```
+5.  **Apply**: It sends the updated object to Kubernetes: `WsClient.K8sClient.Update(ctx, comp)`.
+
+### Step 2: The Controller ([api/internal/controllers/composition/intercepts.go](file:///Users/shubhamsachdeva/kloudlite/api/internal/controllers/composition/intercepts.go))
+1.  **Watch Loop**: The **Controller** (an infinite loop code running in the cluster that watches for changes) detects the updated [Composition](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go#188-199) object.
+2.  **[reconcileIntercepts](file:///Users/shubhamsachdeva/kloudlite/api/internal/controllers/composition/intercepts.go#21-54)**: It sees the new entry in `Spec.Intercepts`.
+3.  **[reconcileSingleIntercept](file:///Users/shubhamsachdeva/kloudlite/api/internal/controllers/composition/intercepts.go#68-222)**: The heavy lifter function.
+    -   **Backup**: Saves the original container config to an **Annotation** (metadata attached to a K8s object, like a sticky note) named `environments.kloudlite.io/original-container`.
+    -   **Replace**: Updates the Deployment to use the `alpine/socat` image.
+    -   **Configure**: Sets the `socat` args to listen on the service port and forward to the workspace.
+4.  **Status Update**: Once the pod restarts with the new proxy image, it marks the intercept as [Active](file:///Users/shubhamsachdeva/kloudlite/api/cmd/kl/cmd/intercept.go#534-540).
+
+---
+
+## 5. Hands-on Lab: Getting Started
+
+Want to see it in action? Since you have the codebase, you can run the "Dev Environment".
+
+### Prerequisites
+-   Docker Desktop (running)
+-   Go 1.24+
+-   `task` (Install via `brew install go-task/tap/go-task` - typically a task runner is a tool that automates repetitive commands)
+
+### Step-by-step Setup
+1.  **Start the Backend**:
+    ```bash
+    cd devenv
+    task api:dev
+    ```
+    *This runs the Control Plane on localhost:8080.*
+
+2.  **Start the Frontend**:
+    Open a second terminal:
+    ```bash
+    cd devenv
+    task web:dev
+    ```
+    *This starts the Dashboard on localhost:3000.*
+
+3.  **Explore**:
+    -   Go to `http://localhost:3000`.
+    -   Login with: `super-admin@kloudlite.io` / `AdminPass123!`.
+
+---
+
+## 6. Business Model: B.Y.O.C. vs. Managed
+
+### The "Control Plane" (Hosted by Kloudlite)
+This is the **Console** (`web/apps/console`) and the **API Server** (`api/cmd/server`). It handles Billing, Auth, and Team Management. Think of this as the "Headquarters."
+
+### The "Data Plane" (Hosted by You - BYOC)
+This is the **Operator** running on your Kubernetes Cluster. Think of this as the "Field Office."
+-   **Bring Your Own Cloud (BYOC)**: You pay AWS/GCP for the servers. You install the Kloudlite Operator.
+-   **Privacy**: Your code/data never leaves your cluster. The Operator only pulls config from the Control Plane.
+
+---
+
+## 8. Detailed File-by-File Manifest
+
+### Backend: `api/`
+
+#### Entry Points (`api/cmd/`)
+*   **`server/`**: The Control Plane API.
+    *   `main.go`: Starts the **Gin** (a popular web framework for Go) server and connects to **Supabase** (an open-source Firebase alternative providing Database and Auth).
+*   **`kl/`**: The Developer CLI tool.
+    *   `main.go`: Logic for `kl login`, `kl intercept`, `kl env switch`.
+*   **`kltun/`**: The Tunnel Daemon.
+    *   `main.go`: Manages the WireGuard interface and **CA Certificate** (Certificate Authority - a digital ID card used to prove your identity for secure HTTPS connections) installation.
+*   **`workmachine-node-manager/`**: A Kubernetes **DaemonSet** (a type of K8s app that ensures exactly one copy runs on *every single node* in the cluster).
+    *   `main.go`: Runs on every node. Installs **Nix** packages (a powerful package manager that can install tools like Node, Go, or Python without polluting the rest of the system) requested by workspaces.
+
+#### Controllers (`api/internal/controllers/`)
+*   **`composition/`**: Manages "Apps" (groups of services).
+    *   `intercepts.go`: The logic for injecting `socat` proxies.
+    *   `deployment.go`: Logic for creating standard Kubernetes Deployments from your Kloudlite config.
+*   **`environment/`**: Manages Namespaces.
+    *   `env_cloning.go`: Logic for deep-copying an environment (e.g., for **PR Previews** - temporary environments created automatically when you submit code for review).
+    *   `network_policy.go`: Configures K8s **NetworkPolicies** (virtual firewalls inside the cluster) to isolate environments from each other.
+*   **`workspace/`**: Manages Dev Containers.
+    *   `workspace_controller.go`: Creates the Pod where you SSH into.
+    *   `networking.go`: Sets up the Headless Service that `socat` forwards to.
+
+### Frontend: `web/`
+
+#### Admin Console (`web/apps/console/`)
+*   **`src/app/installations/`**: Pages for managing Cluster connections.
+*   **`src/app/login/`**: Auth pages using Supabase.
+
+#### Developer Dashboard (`web/apps/dashboard/`)
+*   **`src/app/(main)/`**: Main app layout.
+*   **`src/actions/`**: **Server Actions** (a Next.js feature that allows you to write backend code directly inside your frontend files) for mutations.
+
+#### UI Library (`web/packages/ui/src/`)
+*   `button.tsx`: Reusable Button component.
+*   `dialog.tsx`: Modal dialogs.
+*   `form.tsx`: **React Hook Form** wrappers (a library for managing complex forms easily).
